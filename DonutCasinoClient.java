@@ -51,7 +51,7 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final Pattern PAY = Pattern.compile(
             "(?i)(\\.?\\w{3,17})\\s+paid\\s+you\\s+[^\\d]*?([\\d,]+(?:\\.\\d+)?)\\s*([kmbt]?)(?![a-z])");
 
-    static final int SPIN_TICKS = 80, HOLD_TICKS = 50, CMD_GAP = 25;
+    static final int SPIN_TICKS = 100, HOLD_TICKS = 60, CMD_GAP = 25;
 
     // ================= STATE =================
     static boolean enabled = false;   // OFF until you press K
@@ -66,6 +66,7 @@ public class DonutCasinoClient implements ClientModInitializer {
     static long lastMsgHash; static int lastMsgTick; static int tickCount;
     static Path logFile, debugFile;
     static boolean announced = false;
+    static int lastBase = Integer.MIN_VALUE;
 
     record Spin(String name, long bet, int idx, long payout, boolean simulate) {}
 
@@ -192,7 +193,6 @@ public class DonutCasinoClient implements ClientModInitializer {
         if (current == null && !queue.isEmpty()) { current = queue.poll(); spinTick = 0; }
         if (current != null) {
             spinTick++;
-            if (spinTick % 4 == 0 && spinTick < SPIN_TICKS) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.4f, 1.2f);
             if (spinTick == SPIN_TICKS) {
                 Spin s = current;
                 mc.player.playSound(s.payout() > s.bet() ? SoundEvents.ENTITY_PLAYER_LEVELUP : SoundEvents.BLOCK_NOTE_BLOCK_BASS.value(), 1f, 1f);
@@ -246,51 +246,86 @@ public class DonutCasinoClient implements ClientModInitializer {
             ctx.drawTextWithShadow(mc.textRenderer, Text.literal(bigWinNames.get(i) + "  " + fmt(bigWins.get(i)[0])).formatted(Formatting.GREEN), bx, by + 10 * (i + 1), 0xFFFFFF);
 
         if (!enabled && !testSpin) return;
-        int n = MULT.length, cw = 52, ch = 62, cx = w / 2;
-        int cy = (ctx.getScaledWindowHeight() - ch) / 2;   // centered on screen like the photo
+        final int n = MULT.length, cw = 60, ch = 78, gap = 6, cx = w / 2, hw = 210;
+        int cy = (ctx.getScaledWindowHeight() - ch) / 2;           // centered on screen
         boolean idle = current == null;
-        ctx.fill(cx - 190, cy - 30, cx + 190, cy + ch + 38, 0xAA000000);
+        boolean landed = !idle && spinTick >= SPIN_TICKS;
+        float partial = tc.getTickProgress(false);
+        float time = tickCount + partial;
+
+        // panel with gold lines, like the photo
+        ctx.fillGradient(cx - hw, cy - 34, cx + hw, cy + ch + 42, 0xDD0A0E13, 0xDD16202B);
+        ctx.fill(cx - hw, cy - 34, cx + hw, cy - 33, 0xFFE0B040);
+        ctx.fill(cx - hw, cy + ch + 41, cx + hw, cy + ch + 42, 0xFFE0B040);
         String title = idle ? "Pay YoFusionz $" + fmt(MIN_BET) + " - $" + fmt(MAX_BET) + " to spin"
                 : current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake";
-        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 26, 0xFFFFFF);
+        for (int k = 0; k < 5; k++) ctx.fill(cx - 5 + k, cy - 10 + k, cx + 5 - k, cy - 9 + k, 0xFFE0B040); // pointer arrow
 
+        // smooth position (sub-pixel), strong ease-out so it slows down gracefully
         float pos;
         if (idle) {
-            pos = (tickCount + tc.getTickProgress(false)) * 0.04f;   // slow idle drift
+            pos = time * 0.04f;
         } else {
-            float t = Math.min(1f, (spinTick + tc.getTickProgress(false)) / SPIN_TICKS);
-            float eased = 1f - (1f - t) * (1f - t) * (1f - t);
+            float t = Math.min(1f, (spinTick + partial) / SPIN_TICKS);
+            float inv = 1f - t;
+            float eased = 1f - inv * inv * inv * inv;
             pos = eased * (n * 4 + current.idx());
         }
         int base = Math.round(pos);
-        for (int o = -4; o <= 4; o++) {
+        if (!idle && !landed && base != lastBase) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.35f, 1.5f);
+        lastBase = base;
+
+        ctx.enableScissor(cx - hw, cy - 33, cx + hw, cy + ch + 41);
+        for (int o = -5; o <= 5; o++) {
             int i = Math.floorMod(base + o, n);
-            int fx = cx + (int) ((o - (pos - base)) * (cw + 4)) - cw / 2;
-            if (fx < cx - 190 || fx + cw > cx + 190) continue;
-            ctx.fill(fx, cy, fx + cw, cy + ch, COLOR[i]);                    // colored frame
-            ctx.fill(fx + 2, cy + 2, fx + cw - 2, cy + ch - 2, 0xDD10161C);   // dark inside
-            ctx.fill(fx + 2, cy + ch - 4, fx + cw - 2, cy + ch - 2, COLOR[i]);
+            float off = o - (pos - base);                              // distance from center, in cards
+            float centerX = cx + off * (cw + gap);
+            float f = Math.max(0f, 1f - Math.abs(off) / 1.3f);         // 1 = right in the middle
+            float sc = 1f + 0.14f * f;                                  // middle card grows
             ctx.getMatrices().pushMatrix();
-            ctx.getMatrices().translate(fx + (cw - 24) / 2f, cy + 5);
-            ctx.getMatrices().scale(1.5f, 1.5f);
+            ctx.getMatrices().translate(centerX, cy + ch / 2f);
+            ctx.getMatrices().scale(sc, sc);
+            ctx.getMatrices().translate(-cw / 2f, -ch / 2f);
+
+            ctx.fill(0, 0, cw, ch, COLOR[i]);                           // frame
+            ctx.fill(2, 2, cw - 2, ch - 2, 0xEE10161C);                 // inside
+            ctx.fill(2, ch - 4, cw - 2, ch - 2, COLOR[i]);              // bottom bar
+
+            float bob = (float) Math.sin(time * 0.18f + i * 0.9f) * 2f * (0.5f + f);   // floating item
+            ctx.getMatrices().pushMatrix();
+            ctx.getMatrices().translate(cw / 2f - 16, 8 + bob);
+            ctx.getMatrices().scale(2f, 2f);
             ctx.drawItem(new ItemStack(ICONS[i]), 0, 0);
             ctx.getMatrices().popMatrix();
-            ctx.getMatrices().pushMatrix();
-            ctx.getMatrices().translate(fx + cw / 2f, cy + ch - 32);
-            ctx.getMatrices().scale(1.5f, 1.5f);
+
+            ctx.getMatrices().pushMatrix();                              // multiplier UNDER the item
+            ctx.getMatrices().translate(cw / 2f, 47);
+            ctx.getMatrices().scale(1.6f, 1.6f);
             ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), 0, 0, 0xFFFFFF);
             ctx.getMatrices().popMatrix();
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(String.format("%.1f%%", 100.0 * WEIGHT[i] / TOTAL)), fx + cw / 2, cy + ch - 15, 0xFFCCCCCC);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(String.format("%.1f%%", 100.0 * WEIGHT[i] / TOTAL)), cw / 2, ch - 14, 0xFF9AA5B1);
+
+            int dim = (int) (150 * (1f - f));                           // fade cards far from the middle
+            if (dim > 0) ctx.fill(0, 0, cw, ch, dim << 24);
+
+            if (landed && o == 0) {                                     // winner glow
+                int a = (int) (170 + 85 * Math.sin(time * 0.35f));
+                int c = (a << 24) | 0xFFFFFF;
+                ctx.fill(0, 0, cw, 2, c); ctx.fill(0, ch - 2, cw, ch, c);
+                ctx.fill(0, 0, 2, ch, c); ctx.fill(cw - 2, 0, cw, ch, c);
+            }
+            ctx.getMatrices().popMatrix();
         }
-        ctx.fill(cx - 1, cy - 6, cx + 1, cy + ch + 6, 0xFFFFFFFF); // pointer
+        ctx.disableScissor();
 
         String status;
         if (idle) status = "Waiting for payment...";
-        else if (spinTick < SPIN_TICKS) status = "Spinning...";
+        else if (!landed) status = "Spinning...";
         else status = current.payout() > 0 ? mstr(MULT[current.idx()]) + "x  -  paid $" + fmt(current.payout()) : "0x  -  better luck next time";
         ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(status).formatted(Formatting.GOLD, Formatting.BOLD), cx, cy + ch + 12, 0xFFFFFF);
         if (!queue.isEmpty())
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), cx, cy + ch + 25, 0xFFFFFF);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), cx, cy + ch + 26, 0xFFFFFF);
     }
 
     // ================= UTIL =================
