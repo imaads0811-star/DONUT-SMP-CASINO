@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
 public class DonutCasinoClient implements ClientModInitializer {
 
     // ================= CONFIG =================
-    static final String SERVER_HOST = "donutsmp";
+    static final String SERVER_HOST = "donut";
     static final long MIN_BET = 1_000_000L;        // 1M
     static final long MAX_BET = 25_000_000L;       // 25M
     static final long MAX_PAYOUT = 600_000_000L;   // = 25M x 24x, so the cap never changes a displayed result
@@ -47,14 +47,14 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final Item[] ICONS = {Items.COAL, Items.COPPER_INGOT, Items.IRON_INGOT, Items.GOLD_INGOT,
             Items.LAPIS_LAZULI, Items.EMERALD, Items.DIAMOND, Items.NETHERITE_INGOT, Items.NETHER_STAR};
 
-    // Anchored at start: only real server system messages like ".Name paid you $2.5M"
+    // Reads ".Name paid you $1M" (any glyph/symbol between "you" and the number is OK).
     static final Pattern PAY = Pattern.compile(
-            "(?i)^\\W*(\\.?\\w{3,17})\\s+paid\\s+you\\s+\\$?\\s*([\\d,]+(?:\\.\\d+)?)\\s*([kmbt]?)\\b");
+            "(?i)(\\.?\\w{3,17})\\s+paid\\s+you\\s+[^\\d]*?([\\d,]+(?:\\.\\d+)?)\\s*([kmbt]?)(?![a-z])");
 
     static final int SPIN_TICKS = 80, HOLD_TICKS = 50, CMD_GAP = 25;
 
     // ================= STATE =================
-    static boolean enabled = false;   // starts OFF for safety, press K to turn on
+    static boolean enabled = true;    // ON by default; press K to toggle
     static KeyBinding toggleKey;
     static final SecureRandom RNG = new SecureRandom();
     static final int TOTAL = Arrays.stream(WEIGHT).sum();
@@ -64,13 +64,15 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final List<String> bigWinNames = new ArrayList<>();
     static Spin current; static int spinTick, cmdCooldown;
     static long lastMsgHash; static int lastMsgTick; static int tickCount;
-    static Path logFile;
+    static Path logFile, debugFile;
+    static boolean announced = false;
 
     record Spin(String name, long bet, int idx, long payout, boolean simulate) {}
 
     @Override
     public void onInitializeClient() {
         logFile = FabricLoader.getInstance().getConfigDir().resolve("donutcasino-log.txt");
+        debugFile = FabricLoader.getInstance().getConfigDir().resolve("donutcasino-debug.txt");
         KeyBinding.Category cat = KeyBinding.Category.create(Identifier.of("donutcasino", "main"));
         toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.donutcasino.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
@@ -81,6 +83,12 @@ public class DonutCasinoClient implements ClientModInitializer {
         HudRenderCallback.EVENT.register(DonutCasinoClient::render);
 
         ClientCommandRegistrationCallback.EVENT.register((d, reg) -> {
+            d.register(ClientCommandManager.literal("cdebug").executes(c -> {
+                ServerInfo si = MinecraftClient.getInstance().getCurrentServerEntry();
+                say("enabled=" + enabled + " | server=" + (si == null ? "none" : si.address) + " | onDonut=" + onDonut()
+                        + " | queued=" + queue.size() + " | pay commands waiting=" + commands.size());
+                return 1;
+            }));
             d.register(ClientCommandManager.literal("codds").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("Odds (RTP " + String.format("%.1f", rtp()) + "%, house edge "
                         + String.format("%.1f", 100 - rtp()) + "%) | bets " + fmt(MIN_BET) + "-" + fmt(MAX_BET)
@@ -109,11 +117,24 @@ public class DonutCasinoClient implements ClientModInitializer {
     static double rtp() { double s = 0; for (int i = 0; i < MULT.length; i++) s += MULT[i] * WEIGHT[i]; return 100.0 * s / TOTAL; }
 
     // ================= INPUT =================
+    static void say(String t) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        mc.execute(() -> { if (mc.player != null) mc.player.sendMessage(Text.literal("[Casino] " + t).formatted(Formatting.GOLD), false); });
+    }
+    static void debug(String t) {
+        try { Files.writeString(debugFile, System.currentTimeMillis() + " " + t + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND); }
+        catch (Exception ignored) {}
+    }
+
     static void handle(String text) {
-        if (!enabled || !onDonut()) return;
+        if (!onDonut()) return;
+        if (!text.toLowerCase(Locale.ROOT).contains("paid you")) return;
+        debug("SEEN: " + text);
+        if (!enabled) return;
         Matcher m = PAY.matcher(text);
-        if (!m.find()) return;
-        // de-dupe identical message within 2 ticks
+        if (!m.find()) { say("Saw a payment message I couldn't read: " + text); return; }
+        String prefix = text.substring(0, m.start());
+        if (prefix.contains(":") || prefix.contains("\u00bb") || prefix.contains(">")) { debug("IGNORED (looks like player chat)"); return; }
         long h = text.hashCode();
         if (h == lastMsgHash && tickCount - lastMsgTick < 2) return;
         lastMsgHash = h; lastMsgTick = tickCount;
@@ -124,25 +145,26 @@ public class DonutCasinoClient implements ClientModInitializer {
 
     static void enqueue(String name, long bet, boolean sim) {
         if (bet < MIN_BET || bet > MAX_BET) {
-            // outside 1M-25M -> no spin, no refund: counts as a donation
+            say(name + " paid $" + fmt(bet) + " (outside 1M-25M) - kept as donation");
             if (!sim) log(name, bet, -1, 0, "DONATION outside limits");
             return;
         }
         int idx = roll();
         long payout = Math.min(MAX_PAYOUT, Math.round(bet * MULT[idx]));
         queue.add(new Spin(name, bet, idx, payout, sim));
-    }
-
-    static int roll() {
-        int r = RNG.nextInt(TOTAL), acc = 0;
-        for (int i = 0; i < WEIGHT.length; i++) { acc += WEIGHT[i]; if (r < acc) return i; }
-        return 0;
+        say("Payment from " + name + ": $" + fmt(bet) + " - spinning" + (sim ? " (TEST, no real payout)" : ""));
     }
 
     static long parse(String n, String s) {
         double v; try { v = Double.parseDouble(n); } catch (Exception e) { return 0; }
         switch (s.toLowerCase(Locale.ROOT)) { case "k" -> v *= 1e3; case "m" -> v *= 1e6; case "b" -> v *= 1e9; case "t" -> v *= 1e12; }
         return (long) v;
+    }
+
+    static int roll() {
+        int r = RNG.nextInt(TOTAL), acc = 0;
+        for (int i = 0; i < WEIGHT.length; i++) { acc += WEIGHT[i]; if (r < acc) return i; }
+        return 0;
     }
 
     // ================= TICK =================
@@ -154,11 +176,16 @@ public class DonutCasinoClient implements ClientModInitializer {
             if (mc.player != null) mc.player.sendMessage(Text.literal("Donut Casino: " + (enabled ? "ON (auto-paying!)" : "OFF"))
                     .formatted(enabled ? Formatting.GREEN : Formatting.RED), true);
         }
-        if (mc.player == null) return;
+        if (mc.player == null) { announced = false; return; }
+        boolean on = onDonut();
+        if (on && !announced) say("Donut Casino loaded - " + (enabled ? "ON" : "OFF") + ". Press K to toggle, /cdebug for status.");
+        announced = on;
 
         if (cmdCooldown > 0) cmdCooldown--;
         if (cmdCooldown == 0 && !commands.isEmpty() && enabled && onDonut()) {
-            mc.player.networkHandler.sendChatCommand(commands.poll());
+            String cmd = commands.poll();
+            mc.player.networkHandler.sendChatCommand(cmd);
+            say("Sent /" + cmd);
             cmdCooldown = CMD_GAP;
         }
 
@@ -201,32 +228,32 @@ public class DonutCasinoClient implements ClientModInitializer {
     // ================= HUD =================
     static void render(DrawContext ctx, net.minecraft.client.render.RenderTickCounter tc) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.player == null || !onDonut()) return;
+        if (mc.player == null) return;
+        boolean testSpin = current != null && current.simulate();
+        if (!onDonut() && !testSpin) return;
         int w = ctx.getScaledWindowWidth();
 
-        // published odds panel (always visible when enabled, so players see the real odds)
-        if (enabled) {
-            int x = 6, y = 6;
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal("ODDS  (RTP " + String.format("%.1f", rtp()) + "%)").formatted(Formatting.GOLD, Formatting.BOLD), x, y, 0xFFFFFF);
-            for (int i = 0; i < MULT.length; i++) {
-                y += 10;
-                ctx.drawTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x  " + String.format("%.1f", 100.0 * WEIGHT[i] / TOTAL) + "%"), x, y, COLOR[i] | 0xFF000000);
-            }
-            y += 12;
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Bet " + fmt(MIN_BET) + " - " + fmt(MAX_BET)).formatted(Formatting.YELLOW), x, y, 0xFFFFFF);
-            if (!queue.isEmpty())
-                ctx.drawTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), x, y + 10, 0xFFFFFF);
-
-            // biggest wins
-            int bx = w - 150, by = ctx.getScaledWindowHeight() - 80;
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal("BIGGEST WINS").formatted(Formatting.GOLD, Formatting.BOLD), bx, by, 0xFFFFFF);
-            for (int i = 0; i < bigWins.size(); i++)
-                ctx.drawTextWithShadow(mc.textRenderer, Text.literal(bigWinNames.get(i) + "  " + fmt(bigWins.get(i)[0])).formatted(Formatting.GREEN), bx, by + 10 * (i + 1), 0xFFFFFF);
+        int x = 6, y = 6;
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(enabled ? "CASINO ON" : "CASINO OFF (press K)")
+                .formatted(enabled ? Formatting.GREEN : Formatting.RED, Formatting.BOLD), x, y, 0xFFFFFF);
+        y += 12;
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal("ODDS  (RTP " + String.format("%.1f", rtp()) + "%)").formatted(Formatting.GOLD, Formatting.BOLD), x, y, 0xFFFFFF);
+        for (int i = 0; i < MULT.length; i++) {
+            y += 10;
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x  " + String.format("%.1f", 100.0 * WEIGHT[i] / TOTAL) + "%"), x, y, COLOR[i] | 0xFF000000);
         }
+        y += 12;
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Bet " + fmt(MIN_BET) + " - " + fmt(MAX_BET)).formatted(Formatting.YELLOW), x, y, 0xFFFFFF);
+        if (!queue.isEmpty())
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), x, y + 10, 0xFFFFFF);
+
+        int bx = w - 150, by = ctx.getScaledWindowHeight() - 80;
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal("BIGGEST WINS").formatted(Formatting.GOLD, Formatting.BOLD), bx, by, 0xFFFFFF);
+        for (int i = 0; i < bigWins.size(); i++)
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(bigWinNames.get(i) + "  " + fmt(bigWins.get(i)[0])).formatted(Formatting.GREEN), bx, by + 10 * (i + 1), 0xFFFFFF);
 
         if (current == null) return;
-        // wheel strip
-        int n = MULT.length, cw = 48, ch = 52, cx = w / 2, cy = 40;
+        int n = MULT.length, cw = 52, ch = 62, cx = w / 2, cy = 40;
         ctx.fill(cx - 190, cy - 28, cx + 190, cy + ch + 28, 0xAA000000);
         ctx.drawCenteredTextWithShadow(mc.textRenderer,
                 Text.literal(current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake").formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
@@ -235,19 +262,20 @@ public class DonutCasinoClient implements ClientModInitializer {
         float eased = 1f - (1f - t) * (1f - t) * (1f - t);
         float pos = eased * (n * 4 + current.idx());
         int base = Math.round(pos);
-        for (int o = -3; o <= 3; o++) {
+        for (int o = -4; o <= 4; o++) {
             int i = Math.floorMod(base + o, n);
-            int x = cx + (int) ((o - (pos - base)) * (cw + 4)) - cw / 2;
-            if (x < cx - 190 || x + cw > cx + 190) continue;
-            ctx.fill(x, cy, x + cw, cy + ch, COLOR[i]);                 // colored frame
-            ctx.fill(x + 2, cy + 2, x + cw - 2, cy + ch - 2, 0xDD10161C); // dark inside
-            ctx.fill(x + 2, cy + ch - 4, x + cw - 2, cy + ch - 2, COLOR[i]);
+            int fx = cx + (int) ((o - (pos - base)) * (cw + 4)) - cw / 2;
+            if (fx < cx - 190 || fx + cw > cx + 190) continue;
+            ctx.fill(fx, cy, fx + cw, cy + ch, COLOR[i]);                    // colored frame
+            ctx.fill(fx + 2, cy + 2, fx + cw - 2, cy + ch - 2, 0xDD10161C);   // dark inside
+            ctx.fill(fx + 2, cy + ch - 4, fx + cw - 2, cy + ch - 2, COLOR[i]);
             ctx.getMatrices().pushMatrix();
-            ctx.getMatrices().translate(x + (cw - 24) / 2f, cy + 6);
+            ctx.getMatrices().translate(fx + (cw - 24) / 2f, cy + 5);
             ctx.getMatrices().scale(1.5f, 1.5f);
             ctx.drawItem(new ItemStack(ICONS[i]), 0, 0);
             ctx.getMatrices().popMatrix();
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x"), x + cw / 2, cy + ch - 16, 0xFFFFFF);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), fx + cw / 2, cy + ch - 27, 0xFFFFFF);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(String.format("%.1f%%", 100.0 * WEIGHT[i] / TOTAL)), fx + cw / 2, cy + ch - 15, 0xFFCCCCCC);
         }
         ctx.fill(cx - 1, cy - 6, cx + 1, cy + ch + 6, 0xFFFFFFFF); // pointer
 
