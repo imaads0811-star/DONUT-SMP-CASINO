@@ -246,23 +246,27 @@ public class DonutCasinoClient implements ClientModInitializer {
             ctx.drawTextWithShadow(mc.textRenderer, Text.literal(bigWinNames.get(i) + "  " + fmt(bigWins.get(i)[0])).formatted(Formatting.GREEN), bx, by + 10 * (i + 1), 0xFFFFFF);
 
         if (!enabled && !testSpin) return;
-        final int n = MULT.length, cw = 60, ch = 78, gap = 6, cx = w / 2, hw = 210;
+        final int n = MULT.length, cw = 46, ch = 58, gap = 4, cx = w / 2, hw = 150;
         int cy = (ctx.getScaledWindowHeight() - ch) / 2;           // centered on screen
         boolean idle = current == null;
         boolean landed = !idle && spinTick >= SPIN_TICKS;
         float partial = tc.getTickProgress(false);
         float time = tickCount + partial;
+        long stake = idle ? MIN_BET : current.bet();
 
-        // panel with gold lines, like the photo
-        ctx.fillGradient(cx - hw, cy - 34, cx + hw, cy + ch + 42, 0xDD0A0E13, 0xDD16202B);
-        ctx.fill(cx - hw, cy - 34, cx + hw, cy - 33, 0xFFE0B040);
-        ctx.fill(cx - hw, cy + ch + 41, cx + hw, cy + ch + 42, 0xFFE0B040);
-        String title = idle ? "Pay YoFusionz $" + fmt(MIN_BET) + " - $" + fmt(MAX_BET) + " to spin"
+        // compact, see-through panel
+        ctx.fillGradient(cx - hw, cy - 26, cx + hw, cy + ch + 36, 0x660A0E13, 0x66141C26);
+        ctx.fill(cx - hw, cy - 26, cx + hw, cy - 25, 0xAAE0B040);
+        ctx.fill(cx - hw, cy + ch + 35, cx + hw, cy + ch + 36, 0xAAE0B040);
+        String title = idle ? "Pay YoFusionz $" + fmt(MIN_BET) + " - $" + fmt(MAX_BET)
                 : current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake";
-        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 26, 0xFFFFFF);
-        for (int k = 0; k < 5; k++) ctx.fill(cx - 5 + k, cy - 10 + k, cx + 5 - k, cy - 9 + k, 0xFFE0B040); // pointer arrow
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
+        if (!queue.isEmpty()) {
+            String q = queue.size() + " queued";
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(q).formatted(Formatting.GRAY), cx + hw - 4 - mc.textRenderer.getWidth(q), cy - 20, 0xFFFFFF);
+        }
+        for (int k = 0; k < 4; k++) ctx.fill(cx - 4 + k, cy - 9 + k, cx + 4 - k, cy - 8 + k, 0xCCE0B040); // pointer arrow
 
-        // smooth position (sub-pixel), strong ease-out so it slows down gracefully
         float pos;
         if (idle) {
             pos = time * 0.04f;
@@ -273,47 +277,54 @@ public class DonutCasinoClient implements ClientModInitializer {
             pos = eased * (n * 4 + current.idx());
         }
         int base = Math.round(pos);
-        if (!idle && !landed && base != lastBase) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.35f, 1.5f);
+        if (!idle && !landed && base != lastBase) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.3f, 1.5f);
         lastBase = base;
 
-        ctx.enableScissor(cx - hw, cy - 33, cx + hw, cy + ch + 41);
-        for (int o = -5; o <= 5; o++) {
+        ctx.enableScissor(cx - hw, cy - 25, cx + hw, cy + ch + 35);
+        for (int o = -4; o <= 4; o++) {
             int i = Math.floorMod(base + o, n);
-            float off = o - (pos - base);                              // distance from center, in cards
+            float off = o - (pos - base);
             float centerX = cx + off * (cw + gap);
-            float f = Math.max(0f, 1f - Math.abs(off) / 1.3f);         // 1 = right in the middle
-            float sc = 1f + 0.14f * f;                                  // middle card grows
+            float f = Math.max(0f, 1f - Math.abs(off) / 1.3f);
+            float sc = 1f + 0.12f * f;
+            int col = (COLOR[i] & 0xFFFFFF) | 0xCC000000;
             ctx.getMatrices().pushMatrix();
             ctx.getMatrices().translate(centerX, cy + ch / 2f);
             ctx.getMatrices().scale(sc, sc);
             ctx.getMatrices().translate(-cw / 2f, -ch / 2f);
 
-            ctx.fill(0, 0, cw, ch, COLOR[i]);                           // frame
-            ctx.fill(2, 2, cw - 2, ch - 2, 0xEE10161C);                 // inside
-            ctx.fill(2, ch - 4, cw - 2, ch - 2, COLOR[i]);              // bottom bar
+            ctx.fill(0, 0, cw, ch, col);                                // frame
+            ctx.fill(1, 1, cw - 1, ch - 1, 0x99101820);                 // inside (see-through)
+            ctx.fill(1, ch - 3, cw - 1, ch - 1, col);                   // bottom bar
 
-            float bob = (float) Math.sin(time * 0.18f + i * 0.9f) * 2f * (0.5f + f);   // floating item
-            ctx.getMatrices().pushMatrix();
-            ctx.getMatrices().translate(cw / 2f - 16, 8 + bob);
-            ctx.getMatrices().scale(2f, 2f);
+            float bob = (float) Math.sin(time * 0.18f + i * 0.9f) * 1.5f * (0.5f + f);
+            ctx.getMatrices().pushMatrix();                              // floating item
+            ctx.getMatrices().translate(cw / 2f - 12, 5 + bob);
+            ctx.getMatrices().scale(1.5f, 1.5f);
             ctx.drawItem(new ItemStack(ICONS[i]), 0, 0);
             ctx.getMatrices().popMatrix();
 
-            ctx.getMatrices().pushMatrix();                              // multiplier UNDER the item
-            ctx.getMatrices().translate(cw / 2f, 47);
-            ctx.getMatrices().scale(1.6f, 1.6f);
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), 0, 0, 0xFFFFFF);
+            ctx.getMatrices().pushMatrix();                              // multiplier under the item
+            ctx.getMatrices().translate(cw / 2f, 32);
+            ctx.getMatrices().scale(1.3f, 1.3f);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), 0, 0, 0xFFFFFFFF);
             ctx.getMatrices().popMatrix();
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(String.format("%.1f%%", 100.0 * WEIGHT[i] / TOTAL)), cw / 2, ch - 14, 0xFF9AA5B1);
 
-            int dim = (int) (150 * (1f - f));                           // fade cards far from the middle
+            long amt = Math.min(MAX_PAYOUT, Math.round(stake * MULT[i]));  // money they win at this stake
+            ctx.getMatrices().pushMatrix();
+            ctx.getMatrices().translate(cw / 2f, 46);
+            ctx.getMatrices().scale(0.75f, 0.75f);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal("$" + fmt(amt)), 0, 0, 0xFF7CFC9A);
+            ctx.getMatrices().popMatrix();
+
+            int dim = (int) (110 * (1f - f));
             if (dim > 0) ctx.fill(0, 0, cw, ch, dim << 24);
 
             if (landed && o == 0) {                                     // winner glow
                 int a = (int) (170 + 85 * Math.sin(time * 0.35f));
                 int c = (a << 24) | 0xFFFFFF;
-                ctx.fill(0, 0, cw, 2, c); ctx.fill(0, ch - 2, cw, ch, c);
-                ctx.fill(0, 0, 2, ch, c); ctx.fill(cw - 2, 0, cw, ch, c);
+                ctx.fill(0, 0, cw, 1, c); ctx.fill(0, ch - 1, cw, ch, c);
+                ctx.fill(0, 0, 1, ch, c); ctx.fill(cw - 1, 0, cw, ch, c);
             }
             ctx.getMatrices().popMatrix();
         }
@@ -323,9 +334,22 @@ public class DonutCasinoClient implements ClientModInitializer {
         if (idle) status = "Waiting for payment...";
         else if (!landed) status = "Spinning...";
         else status = current.payout() > 0 ? mstr(MULT[current.idx()]) + "x  -  paid $" + fmt(current.payout()) : "0x  -  better luck next time";
-        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(status).formatted(Formatting.GOLD, Formatting.BOLD), cx, cy + ch + 12, 0xFFFFFF);
-        if (!queue.isEmpty())
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), cx, cy + ch + 26, 0xFFFFFF);
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(status).formatted(Formatting.GOLD, Formatting.BOLD), cx, cy + ch + 6, 0xFFFFFF);
+
+        // small odds footer so players can always see the real chances
+        for (int row = 0; row < 2; row++) {
+            StringBuilder sb = new StringBuilder();
+            int from = row == 0 ? 0 : 5, to = row == 0 ? 5 : n;
+            for (int i = from; i < to; i++) {
+                if (i > from) sb.append("   ");
+                sb.append(mstr(MULT[i])).append("x ").append(String.format("%.1f", 100.0 * WEIGHT[i] / TOTAL)).append("%");
+            }
+            ctx.getMatrices().pushMatrix();
+            ctx.getMatrices().translate(cx, cy + ch + 18 + row * 8);
+            ctx.getMatrices().scale(0.65f, 0.65f);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(sb.toString()), 0, 0, 0xFF9AA5B1);
+            ctx.getMatrices().popMatrix();
+        }
     }
 
     // ================= UTIL =================
