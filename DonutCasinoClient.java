@@ -54,7 +54,7 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final int SPIN_TICKS = 80, HOLD_TICKS = 50, CMD_GAP = 25;
 
     // ================= STATE =================
-    static boolean enabled = true;    // ON by default; press K to toggle
+    static boolean enabled = false;   // OFF until you press K
     static KeyBinding toggleKey;
     static final SecureRandom RNG = new SecureRandom();
     static final int TOTAL = Arrays.stream(WEIGHT).sum();
@@ -244,23 +244,29 @@ public class DonutCasinoClient implements ClientModInitializer {
         }
         y += 12;
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Bet " + fmt(MIN_BET) + " - " + fmt(MAX_BET)).formatted(Formatting.YELLOW), x, y, 0xFFFFFF);
-        if (!queue.isEmpty())
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), x, y + 10, 0xFFFFFF);
 
         int bx = w - 150, by = ctx.getScaledWindowHeight() - 80;
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal("BIGGEST WINS").formatted(Formatting.GOLD, Formatting.BOLD), bx, by, 0xFFFFFF);
         for (int i = 0; i < bigWins.size(); i++)
             ctx.drawTextWithShadow(mc.textRenderer, Text.literal(bigWinNames.get(i) + "  " + fmt(bigWins.get(i)[0])).formatted(Formatting.GREEN), bx, by + 10 * (i + 1), 0xFFFFFF);
 
-        if (current == null) return;
-        int n = MULT.length, cw = 52, ch = 62, cx = w / 2, cy = 40;
-        ctx.fill(cx - 190, cy - 28, cx + 190, cy + ch + 28, 0xAA000000);
-        ctx.drawCenteredTextWithShadow(mc.textRenderer,
-                Text.literal(current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake").formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
+        if (!enabled && !testSpin) return;
+        int n = MULT.length, cw = 52, ch = 62, cx = w / 2;
+        int cy = (ctx.getScaledWindowHeight() - ch) / 2;   // centered on screen like the photo
+        boolean idle = current == null;
+        ctx.fill(cx - 190, cy - 30, cx + 190, cy + ch + 38, 0xAA000000);
+        String title = idle ? "Pay YoFusionz $" + fmt(MIN_BET) + " - $" + fmt(MAX_BET) + " to spin"
+                : current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake";
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
 
-        float t = Math.min(1f, (spinTick + tc.getTickProgress(false)) / SPIN_TICKS);
-        float eased = 1f - (1f - t) * (1f - t) * (1f - t);
-        float pos = eased * (n * 4 + current.idx());
+        float pos;
+        if (idle) {
+            pos = (tickCount + tc.getTickProgress(false)) * 0.04f;   // slow idle drift
+        } else {
+            float t = Math.min(1f, (spinTick + tc.getTickProgress(false)) / SPIN_TICKS);
+            float eased = 1f - (1f - t) * (1f - t) * (1f - t);
+            pos = eased * (n * 4 + current.idx());
+        }
         int base = Math.round(pos);
         for (int o = -4; o <= 4; o++) {
             int i = Math.floorMod(base + o, n);
@@ -280,9 +286,12 @@ public class DonutCasinoClient implements ClientModInitializer {
         ctx.fill(cx - 1, cy - 6, cx + 1, cy + ch + 6, 0xFFFFFFFF); // pointer
 
         String status;
-        if (spinTick < SPIN_TICKS) status = "Spinning...";
+        if (idle) status = "Waiting for payment...";
+        else if (spinTick < SPIN_TICKS) status = "Spinning...";
         else status = current.payout() > 0 ? mstr(MULT[current.idx()]) + "x  -  paid $" + fmt(current.payout()) : "0x  -  better luck next time";
         ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(status).formatted(Formatting.GOLD, Formatting.BOLD), cx, cy + ch + 12, 0xFFFFFF);
+        if (!queue.isEmpty())
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(queue.size() + " queued").formatted(Formatting.GRAY), cx, cy + ch + 25, 0xFFFFFF);
     }
 
     // ================= UTIL =================
