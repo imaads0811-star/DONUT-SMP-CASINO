@@ -44,8 +44,8 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final int[]    COLOR  = {0xFFAA2222, 0xFF555566, 0xFF2E6F95, 0xFF3A9A3A, 0xFF9A8A1E, 0xFFD2691E, 0xFFC0399A, 0xFF8A2BE2, 0xFF00A8A8};
 
     // Picture shown on each wheel frame (same order as MULT). Change to any item you like.
-    static final Item[] ICONS = {Items.COAL, Items.COPPER_INGOT, Items.IRON_INGOT, Items.GOLD_INGOT,
-            Items.LAPIS_LAZULI, Items.EMERALD, Items.DIAMOND, Items.NETHERITE_INGOT, Items.NETHER_STAR};
+    static final Item[] ICONS = {Items.COBBLESTONE, Items.BONE, Items.ENDER_PEARL, Items.GOLDEN_APPLE,
+            Items.TOTEM_OF_UNDYING, Items.ENCHANTED_GOLDEN_APPLE, Items.ELYTRA, Items.SPAWNER, Items.DRAGON_EGG};
 
     // Reads ".Name paid you $1M" (any glyph/symbol between "you" and the number is OK).
     static final Pattern PAY = Pattern.compile(
@@ -237,11 +237,6 @@ public class DonutCasinoClient implements ClientModInitializer {
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal(enabled ? "CASINO ON" : "CASINO OFF (press K)")
                 .formatted(enabled ? Formatting.GREEN : Formatting.RED, Formatting.BOLD), x, y, 0xFFFFFF);
         y += 12;
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal("ODDS  (RTP " + String.format("%.1f", rtp()) + "%)").formatted(Formatting.GOLD, Formatting.BOLD), x, y, 0xFFFFFF);
-        for (int i = 0; i < MULT.length; i++) {
-            y += 10;
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x  " + String.format("%.1f", 100.0 * WEIGHT[i] / TOTAL) + "%"), x, y, COLOR[i] | 0xFF000000);
-        }
         y += 12;
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Bet " + fmt(MIN_BET) + " - " + fmt(MAX_BET)).formatted(Formatting.YELLOW), x, y, 0xFFFFFF);
 
@@ -280,7 +275,11 @@ public class DonutCasinoClient implements ClientModInitializer {
             ctx.getMatrices().scale(1.5f, 1.5f);
             ctx.drawItem(new ItemStack(ICONS[i]), 0, 0);
             ctx.getMatrices().popMatrix();
-            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), fx + cw / 2, cy + ch - 27, 0xFFFFFF);
+            ctx.getMatrices().pushMatrix();
+            ctx.getMatrices().translate(fx + cw / 2f, cy + ch - 32);
+            ctx.getMatrices().scale(1.5f, 1.5f);
+            ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(mstr(MULT[i]) + "x").formatted(Formatting.BOLD), 0, 0, 0xFFFFFF);
+            ctx.getMatrices().popMatrix();
             ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(String.format("%.1f%%", 100.0 * WEIGHT[i] / TOTAL)), fx + cw / 2, cy + ch - 15, 0xFFCCCCCC);
         }
         ctx.fill(cx - 1, cy - 6, cx + 1, cy + ch + 6, 0xFFFFFFFF); // pointer
