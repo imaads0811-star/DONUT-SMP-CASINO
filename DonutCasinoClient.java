@@ -51,18 +51,24 @@ public class DonutCasinoClient implements ClientModInitializer {
     static final Pattern PAY = Pattern.compile(
             "(?i)(\\.?\\w{3,17})\\s+paid\\s+you\\s+[^\\d]*?([\\d,]+(?:\\.\\d+)?)\\s*([kmbt]?)(?![a-z])");
 
-    static final int SPIN_TICKS = 100, HOLD_TICKS = 60, CMD_GAP = 25;
+    // Reads your own payment: "You paid .Name $30M (+$600K tax)" -> first number after the name is the amount
+    static final Pattern SENT = Pattern.compile(
+            "(?i)you\\s+paid\\s+(\\.?\\w{3,17})\\s+[^\\d]*?([\\d,]+(?:\\.\\d+)?)\\s*([kmbt]?)(?![a-z])");
+
+    static final int SPIN_TICKS = 100, HOLD_TICKS = 60;
 
     // ================= STATE =================
     static boolean enabled = false;   // OFF until you press K
-    static KeyBinding toggleKey;
+    static KeyBinding toggleKey, paidKey;
     static final SecureRandom RNG = new SecureRandom();
     static final int TOTAL = Arrays.stream(WEIGHT).sum();
     static final Deque<Spin> queue = new ArrayDeque<>();
-    static final Deque<String> commands = new ArrayDeque<>();
+    record Pay(String name, long amount) {}
+    static final List<Pay> pending = new ArrayList<>();   // payouts YOU still need to send by hand
+    static Path pendingFile;
     static final List<long[]> bigWins = new ArrayList<>(); // {payout} paired with names below
     static final List<String> bigWinNames = new ArrayList<>();
-    static Spin current; static int spinTick, cmdCooldown;
+    static Spin current; static int spinTick;
     static long lastMsgHash; static int lastMsgTick; static int tickCount;
     static Path logFile, debugFile;
     static boolean announced = false;
@@ -74,9 +80,13 @@ public class DonutCasinoClient implements ClientModInitializer {
     public void onInitializeClient() {
         logFile = FabricLoader.getInstance().getConfigDir().resolve("donutcasino-log.txt");
         debugFile = FabricLoader.getInstance().getConfigDir().resolve("donutcasino-debug.txt");
+        pendingFile = FabricLoader.getInstance().getConfigDir().resolve("donutcasino-pending.txt");
+        loadPending();
         KeyBinding.Category cat = KeyBinding.Category.create(Identifier.of("donutcasino", "main"));
         toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.donutcasino.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
+        paidKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.donutcasino.paid", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_J, cat));
 
         // GAME only (server system messages) -> players can't spoof payments via public chat
         ClientReceiveMessageEvents.GAME.register((msg, overlay) -> { if (!overlay) handle(msg.getString()); });
@@ -84,10 +94,13 @@ public class DonutCasinoClient implements ClientModInitializer {
         HudRenderCallback.EVENT.register(DonutCasinoClient::render);
 
         ClientCommandRegistrationCallback.EVENT.register((d, reg) -> {
+            d.register(ClientCommandManager.literal("cpaid")
+                    .executes(c -> { markPaid(false); return 1; })
+                    .then(ClientCommandManager.literal("all").executes(c -> { markPaid(true); return 1; })));
             d.register(ClientCommandManager.literal("cdebug").executes(c -> {
                 ServerInfo si = MinecraftClient.getInstance().getCurrentServerEntry();
                 say("enabled=" + enabled + " | server=" + (si == null ? "none" : si.address) + " | onDonut=" + onDonut()
-                        + " | queued=" + queue.size() + " | pay commands waiting=" + commands.size());
+                        + " | queued=" + queue.size() + " | payouts to send=" + pending.size());
                 return 1;
             }));
             d.register(ClientCommandManager.literal("codds").executes(c -> {
@@ -129,7 +142,9 @@ public class DonutCasinoClient implements ClientModInitializer {
 
     static void handle(String text) {
         if (!onDonut()) return;
-        if (!text.toLowerCase(Locale.ROOT).contains("paid you")) return;
+        String low = text.toLowerCase(Locale.ROOT);
+        if (low.contains("you paid")) { handleMyPayment(text); return; }
+        if (!low.contains("paid you")) return;
         debug("SEEN: " + text);
         if (!enabled) return;
         Matcher m = PAY.matcher(text);
@@ -171,10 +186,12 @@ public class DonutCasinoClient implements ClientModInitializer {
     // ================= TICK =================
     static void tick(MinecraftClient mc) {
         tickCount++;
+        while (paidKey.wasPressed()) markPaid(false);
         while (toggleKey.wasPressed()) {
             enabled = !enabled;
-            if (!enabled) { queue.clear(); }
-            if (mc.player != null) mc.player.sendMessage(Text.literal("Donut Casino: " + (enabled ? "ON (auto-paying!)" : "OFF"))
+            if (!enabled && (current != null || !queue.isEmpty()))
+                say("Casino OFF - " + (queue.size() + (current != null ? 1 : 0)) + " paid spin(s) are waiting. Turn it back on to finish them.");
+            if (mc.player != null) mc.player.sendMessage(Text.literal("Donut Casino: " + (enabled ? "ON" : "OFF"))
                     .formatted(enabled ? Formatting.GREEN : Formatting.RED), true);
         }
         if (mc.player == null) { announced = false; return; }
@@ -182,28 +199,99 @@ public class DonutCasinoClient implements ClientModInitializer {
         if (on && !announced) say("Donut Casino loaded - " + (enabled ? "ON" : "OFF") + ". Press K to toggle, /cdebug for status.");
         announced = on;
 
-        if (cmdCooldown > 0) cmdCooldown--;
-        if (cmdCooldown == 0 && !commands.isEmpty() && enabled && onDonut()) {
-            String cmd = commands.poll();
-            mc.player.networkHandler.sendChatCommand(cmd);
-            say("Sent /" + cmd);
-            cmdCooldown = CMD_GAP;
-        }
-
-        if (current == null && !queue.isEmpty()) { current = queue.poll(); spinTick = 0; }
+        // next spin only starts when nothing is waiting to be paid
+        if (enabled && current == null && !queue.isEmpty() && pending.isEmpty()) { current = queue.poll(); spinTick = 0; }
         if (current != null) {
             spinTick++;
             if (spinTick == SPIN_TICKS) {
                 Spin s = current;
                 mc.player.playSound(s.payout() > s.bet() ? SoundEvents.ENTITY_PLAYER_LEVELUP : SoundEvents.BLOCK_NOTE_BLOCK_BASS.value(), 1f, 1f);
+                String tag = s.simulate() ? "(TEST) " : "";
+                if (s.payout() > 0) say(tag + s.name() + " won $" + fmt(s.payout()) + "  ->  pay with: /pay " + s.name() + " " + s.payout());
                 if (!s.simulate()) {
-                    if (s.payout() > 0) commands.add("pay " + s.name() + " " + s.payout());
+                    if (s.payout() > 0) addPending(s.name(), s.payout());
                     log(s.name(), s.bet(), s.idx(), s.payout(), "SPIN");
                 }
                 if (s.payout() > s.bet()) recordWin(s.name(), s.payout());
             }
-            if (spinTick >= SPIN_TICKS + HOLD_TICKS) current = null;
+            // real spins stay on screen until you press J (paid); test spins clear themselves
+            if (current.simulate() && spinTick >= SPIN_TICKS + HOLD_TICKS) current = null;
         }
+    }
+
+    // ================= MANUAL PAYOUTS =================
+    static void addPending(String name, long amount) { pending.add(new Pay(name, amount)); savePending(); }
+
+    static void markPaid(boolean all) {
+        if (pending.isEmpty()) { say("Nothing left to pay."); return; }
+        if (all) { pending.clear(); say("Cleared all payouts."); }
+        else { Pay p = pending.remove(0); say("Marked paid: " + p.name() + " $" + fmt(p.amount())); }
+        savePending();
+        releaseIfPaid();   // winner paid -> next queued spin can start
+    }
+
+    // ================= DETECT YOUR PAYMENT (reads chat only, sends nothing) =================
+    static void handleMyPayment(String text) {
+        if (pending.isEmpty()) return;
+        Matcher m = SENT.matcher(text);
+        if (!m.find()) return;
+        String prefix = text.substring(0, m.start());
+        if (prefix.contains(":") || prefix.contains("\u00bb") || prefix.contains(">")) return;
+        String name = m.group(1);
+        long amt = parse(m.group(2).replace(",", ""), m.group(3));
+        debug("YOU PAID: " + text);
+        MinecraftClient.getInstance().execute(() -> applyPayment(name, amt));
+    }
+
+    static String clean(String n) { return n.startsWith(".") ? n.substring(1).toLowerCase(Locale.ROOT) : n.toLowerCase(Locale.ROOT); }
+
+    static void applyPayment(String name, long amt) {
+        for (int i = 0; i < pending.size(); i++) {
+            Pay p = pending.get(i);
+            if (!clean(p.name()).equals(clean(name))) continue;
+            if (amt >= p.amount() * 0.995) {
+                pending.remove(i);
+                say("Paid " + p.name() + " $" + fmt(p.amount()) + " - next spin can start.");
+            } else {
+                long left = p.amount() - amt;
+                pending.set(i, new Pay(p.name(), left));
+                say("Paid $" + fmt(amt) + " - you still owe " + p.name() + " $" + fmt(left));
+            }
+            savePending();
+            releaseIfPaid();
+            return;
+        }
+    }
+
+    static long owedTo(String name, long fallback) {
+        for (Pay p : pending) if (clean(p.name()).equals(clean(name))) return p.amount();
+        return fallback;
+    }
+
+    // free the wheel once the current winner no longer has anything owed
+    static void releaseIfPaid() {
+        if (current != null && !current.simulate() && spinTick >= SPIN_TICKS) {
+            for (Pay p : pending) if (clean(p.name()).equals(clean(current.name()))) return;
+            current = null;
+        }
+    }
+
+    static void savePending() {
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (Pay p : pending) sb.append(p.name()).append('|').append(p.amount()).append('\n');
+            Files.writeString(pendingFile, sb.toString());
+        } catch (Exception ignored) {}
+    }
+
+    static void loadPending() {
+        try {
+            if (!Files.exists(pendingFile)) return;
+            for (String line : Files.readAllLines(pendingFile)) {
+                String[] parts = line.split("\\|");
+                if (parts.length == 2) pending.add(new Pay(parts[0], Long.parseLong(parts[1].trim())));
+            }
+        } catch (Exception ignored) {}
     }
 
     static void recordWin(String name, long payout) {
@@ -240,6 +328,17 @@ public class DonutCasinoClient implements ClientModInitializer {
         y += 12;
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Bet " + fmt(MIN_BET) + " - " + fmt(MAX_BET)).formatted(Formatting.YELLOW), x, y, 0xFFFFFF);
 
+        // payouts you still need to send by hand
+        if (enabled || !pending.isEmpty()) {
+            int tx = w - 170, ty = 6;
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal("TO PAY (" + pending.size() + ")  J = paid").formatted(Formatting.RED, Formatting.BOLD), tx, ty, 0xFFFFFF);
+            for (int i = 0; i < Math.min(6, pending.size()); i++) {
+                Pay pay = pending.get(i);
+                ctx.drawTextWithShadow(mc.textRenderer, Text.literal(pay.name() + "  $" + fmt(pay.amount())).formatted(i == 0 ? Formatting.YELLOW : Formatting.WHITE), tx, ty + 10 * (i + 1), 0xFFFFFF);
+            }
+            if (pending.size() > 6) ctx.drawTextWithShadow(mc.textRenderer, Text.literal("+" + (pending.size() - 6) + " more").formatted(Formatting.GRAY), tx, ty + 70, 0xFFFFFF);
+        }
+
         int bx = w - 150, by = ctx.getScaledWindowHeight() - 80;
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal("BIGGEST WINS").formatted(Formatting.GOLD, Formatting.BOLD), bx, by, 0xFFFFFF);
         for (int i = 0; i < bigWins.size(); i++)
@@ -258,9 +357,11 @@ public class DonutCasinoClient implements ClientModInitializer {
         ctx.fillGradient(cx - hw, cy - 26, cx + hw, cy + ch + 36, 0x660A0E13, 0x66141C26);
         ctx.fill(cx - hw, cy - 26, cx + hw, cy - 25, 0xAAE0B040);
         ctx.fill(cx - hw, cy + ch + 35, cx + hw, cy + ch + 36, 0xAAE0B040);
+        boolean mustPay = landed && !current.simulate();
         String title = idle ? "Pay YoFusionz $" + fmt(MIN_BET) + " - $" + fmt(MAX_BET)
+                : mustPay ? "PAY " + current.name() + " $" + fmt(owedTo(current.name(), current.payout()))
                 : current.name() + " \u2022 $" + String.format("%,d", current.bet()) + " stake";
-        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(Formatting.YELLOW), cx, cy - 20, 0xFFFFFF);
+        ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(title).formatted(mustPay ? Formatting.RED : Formatting.YELLOW, Formatting.BOLD), cx, cy - 20, 0xFFFFFF);
         if (!queue.isEmpty()) {
             String q = queue.size() + " queued";
             ctx.drawTextWithShadow(mc.textRenderer, Text.literal(q).formatted(Formatting.GRAY), cx + hw - 4 - mc.textRenderer.getWidth(q), cy - 20, 0xFFFFFF);
@@ -333,7 +434,7 @@ public class DonutCasinoClient implements ClientModInitializer {
         String status;
         if (idle) status = "Waiting for payment...";
         else if (!landed) status = "Spinning...";
-        else status = current.payout() > 0 ? mstr(MULT[current.idx()]) + "x  -  paid $" + fmt(current.payout()) : "0x  -  better luck next time";
+        else status = mstr(MULT[current.idx()]) + "x  -  " + current.name() + (MULT[current.idx()] >= 1 ? " wins $" : " gets back $") + fmt(current.payout());
         ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(status).formatted(Formatting.GOLD, Formatting.BOLD), cx, cy + ch + 6, 0xFFFFFF);
 
         // small odds footer so players can always see the real chances
